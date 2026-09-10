@@ -60,77 +60,6 @@ jobs:
       system-dir: testapp1234
       app-type: api
       require-approval: false
-  docker-backend-uat:
-    permissions:
-      contents: read
-      packages: write
-      security-events: write
-    needs:
-      - build
-    if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'uat' }}
-    uses: Alpha-Explora/alphaci-workflow/.github/workflows/docker-build.yml@v1
-    with:
-      working-directory: .
-      image-name: alphaci-backend-uat-testapp1234
-      dockerfile-path: Dockerfile
-      push-image: true
-      scan-vulnerabilities: true
-      fail-on-vulnerabilities: true
-  deploy-render-backend-uat:
-    needs:
-      - docker-backend-uat
-    if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'uat' }}
-    uses: Alpha-Explora/alphaci-workflow/.github/workflows/render-deploy.yml@v1
-    with:
-      system-name: testapp1234
-      environment: uat
-      branch: uat
-      deploy-mode: auto
-      healthcheck-path: /api/v1/health
-      require-api-center-check: true
-    secrets:
-      RENDER_DEPLOY_HOOK_URL_DEV: ${{ secrets.RENDER_DEPLOY_HOOK_URL_UAT }}
-      RENDER_HEALTHCHECK_URL_DEV: ${{ secrets.RENDER_HEALTHCHECK_URL_UAT }}
-      RENDER_DEPLOY_HOOK_URL_UAT: ${{ secrets.RENDER_DEPLOY_HOOK_URL_UAT }}
-      RENDER_HEALTHCHECK_URL_UAT: ${{ secrets.RENDER_HEALTHCHECK_URL_UAT }}
-      RENDER_DEPLOY_HOOK_URL_MAIN: ${{ secrets.RENDER_DEPLOY_HOOK_URL_UAT }}
-      RENDER_HEALTHCHECK_URL_MAIN: ${{ secrets.RENDER_HEALTHCHECK_URL_UAT }}
-  docker-backend-main:
-    permissions:
-      contents: read
-      packages: write
-      security-events: write
-    needs:
-      - build
-      - production-gate
-    if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'main' }}
-    uses: Alpha-Explora/alphaci-workflow/.github/workflows/docker-build.yml@v1
-    with:
-      working-directory: .
-      image-name: alphaci-backend-main-testapp1234
-      dockerfile-path: Dockerfile
-      push-image: true
-      scan-vulnerabilities: true
-      fail-on-vulnerabilities: true
-  deploy-render-backend-main:
-    needs:
-      - docker-backend-main
-    if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'main' }}
-    uses: Alpha-Explora/alphaci-workflow/.github/workflows/render-deploy.yml@v1
-    with:
-      system-name: testapp1234
-      environment: production
-      branch: main
-      deploy-mode: auto
-      healthcheck-path: /api/v1/health
-      require-api-center-check: true
-    secrets:
-      RENDER_DEPLOY_HOOK_URL_DEV: ${{ secrets.RENDER_DEPLOY_HOOK_URL_MAIN }}
-      RENDER_HEALTHCHECK_URL_DEV: ${{ secrets.RENDER_HEALTHCHECK_URL_MAIN }}
-      RENDER_DEPLOY_HOOK_URL_UAT: ${{ secrets.RENDER_DEPLOY_HOOK_URL_MAIN }}
-      RENDER_HEALTHCHECK_URL_UAT: ${{ secrets.RENDER_HEALTHCHECK_URL_MAIN }}
-      RENDER_DEPLOY_HOOK_URL_MAIN: ${{ secrets.RENDER_DEPLOY_HOOK_URL_MAIN }}
-      RENDER_HEALTHCHECK_URL_MAIN: ${{ secrets.RENDER_HEALTHCHECK_URL_MAIN }}
   promote-to-uat:
     permissions:
       contents: read
@@ -152,9 +81,7 @@ jobs:
       pull-requests: write
     needs:
       - build
-      - docker-backend-uat
-      - deploy-render-backend-uat
-    if: ${{ !cancelled() && (github.event.workflow_run.head_branch || github.ref_name) == 'uat' && needs.build.result == 'success' && (needs['docker-backend-uat'].result == 'success' || needs['docker-backend-uat'].result == 'skipped') && (needs['deploy-render-backend-uat'].result == 'success' || needs['deploy-render-backend-uat'].result == 'skipped') }}
+    if: ${{ !cancelled() && (github.event.workflow_run.head_branch || github.ref_name) == 'uat' && needs.build.result == 'success' }}
     uses: Alpha-Explora/alphaci-workflow/.github/workflows/promotion.yml@v1
     with:
       pipeline-kind: single
@@ -168,11 +95,11 @@ jobs:
     needs:
       - validate-access
       - build
-      - docker-backend-uat
-      - deploy-render-backend-uat
-      - docker-backend-main
-      - deploy-render-backend-main
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     env:
       ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
       ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
@@ -198,10 +125,33 @@ jobs:
             CONCLUSION="success"
           fi
 
-          # Report the failed GitHub job name so ALPHACI can give a specific fix
+          # Capture WHY the stage failed: the job, the step inside it that failed,
+          # and the annotations GitHub recorded (lint errors, failing tests,
+          # compiler output). Without these the product can only say THAT a stage
+          # failed, which is what sent people to GitHub to learn anything useful.
           FAILED_JOBS=""
+          ANNOTATIONS="[]"
           if [ "$CONCLUSION" = "failure" ]; then
-            FAILED_JOBS=$(curl -sf --max-time 5 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/jobs?filter=latest" | jq -r '.jobs[] | select(.conclusion == "failure") | "Failed GitHub Actions job: \(.name)"' | head -n 5 || true)
+            JOBS_JSON=$(curl -sf --max-time 10 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/jobs?filter=latest" || printf '{"jobs":[]}')
+            FAILED_JOBS=$(printf '%s' "$JOBS_JSON" | jq -r '.jobs[] | select(.conclusion == "failure") | . as $job | (([$job.steps[]? | select(.conclusion == "failure") | .name] | first) // "") as $step | if $step == "" then "Failed GitHub Actions job: \($job.name)" else "Failed GitHub Actions job: \($job.name) > \($step)" end' | head -n 5 || true)
+            # A job id is its check-run id for Actions, so one id addresses both.
+            FAILED_IDS=$(printf '%s' "$JOBS_JSON" | jq -r '.jobs[] | select(.conclusion == "failure") | .id' | head -n 3)
+            for JOB_ID in $FAILED_IDS; do
+              JOB_ANN=$(curl -sf --max-time 10 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/check-runs/$JOB_ID/annotations" || printf '[]')
+              # Keep the annotations that point at CODE, at any level.
+              #
+              # Filtering on annotation_level == "failure" looked right and threw away
+              # every useful annotation. A Roslyn analyzer or formatter reports its
+              # diagnostics as WARNINGS - "Program.cs:11 Await RunAsync instead" -
+              # while the only failure-level annotation is the runner's own "Process
+              # completed with exit code 1", whose path is the workflow file. So the
+              # filter kept the one annotation that says nothing and discarded every
+              # one that named the actual problem.
+              #
+              # Deduplicated because a solution built more than once (analyze, then
+              # sonar) reports the same diagnostic on each pass.
+              ANNOTATIONS=$(printf '%s %s' "$ANNOTATIONS" "$JOB_ANN" | jq -s -c 'add | map(select(.path and (.path | startswith(".github") | not))) | map(select(.message and (.message | test("Process completed with exit code") | not))) | map({path: .path, line: .start_line, title: .title, message: .message}) | unique_by([.path, .line, .message]) | .[0:20]' || printf '%s' "$ANNOTATIONS")
+            done
           fi
 
           # Build results sub-object (quality stage only — reads from job outputs)
@@ -217,7 +167,8 @@ jobs:
             --arg conclusion "$CONCLUSION" \
             --arg rawLogs "$FAILED_JOBS" \
             --argjson results "$RESULTS" \
-            '{repoFullName:$repo,branch:$branch,commitSha:$sha,runId:$runId,stage:$stage,conclusion:$conclusion,results:$results,rawLogs:$rawLogs}')
+            --argjson annotations "$ANNOTATIONS" \
+            '{repoFullName:$repo,branch:$branch,commitSha:$sha,runId:$runId,stage:$stage,conclusion:$conclusion,results:$results,rawLogs:$rawLogs,annotations:$annotations}')
           curl -sf --max-time 5 \
             -X POST "$ALPHACI_REPORT_URL" \
             -H "Authorization: Bearer $ALPHACI_TOKEN" \
